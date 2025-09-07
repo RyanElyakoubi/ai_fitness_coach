@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'dart:convert';
 import 'dart:math' as math;
+import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -144,5 +145,102 @@ class SamplingService {
       approxTotalBase64Bytes: totalBytes,
       diagnostics: diag,
     );
+  }
+
+  /// Returns up to 8 evenly spaced, small JPEG scout frames from the currently
+  /// chosen trimmed window if present; otherwise across the whole video.
+  /// Size ~320px width; quality ~60.
+  Future<List<Uint8List>> getScoutFramesForPrecheck({
+    required String videoPath,
+    required int desiredCount,
+    required Duration? windowStart,
+    required Duration? windowEnd,
+  }) async {
+    final count = desiredCount.clamp(4, 8);
+    final frames = <Uint8List>[];
+
+    try {
+      // Get video duration
+      final durMs = await _getDurationMs(videoPath);
+      if (durMs <= 0) return frames;
+
+      final startMs = (windowStart?.inMilliseconds ?? 0);
+      final endMs = (windowEnd?.inMilliseconds ?? durMs);
+      final span = math.max(1, endMs - startMs);
+
+      // Generate evenly spaced timestamps
+      for (int i = 0; i < count; i++) {
+        final ts = startMs + ((i + 1) * (span ~/ (count + 1)));
+        final jpg = await _makeThumbnailAt(
+          videoPath: videoPath,
+          millis: ts,
+          width: 320,
+          quality: 60,
+        );
+        if (jpg != null) frames.add(jpg);
+      }
+    } catch (e) {
+      debugPrint("Error generating scout frames: $e");
+    }
+    
+    return frames;
+  }
+
+  /// Helper to get video duration in milliseconds
+  Future<int> _getDurationMs(String videoPath) async {
+    try {
+      final data = await VideoThumbnail.thumbnailData(
+        video: videoPath,
+        imageFormat: ImageFormat.JPEG,
+        quality: 20,
+        timeMs: 0,
+      );
+      if (data == null) return 0;
+
+      // Binary search for duration
+      int guessMs = 60 * 1000; // fallback to 60s guess then tighten
+      int hi = 15 * 60 * 1000;
+      int lo = 0;
+      for (int i = 0; i < 22; i++) {
+        final ms = guessMs;
+        final data = await VideoThumbnail.thumbnailData(
+          video: videoPath,
+          imageFormat: ImageFormat.JPEG,
+          quality: 20,
+          timeMs: ms,
+        );
+        if (data == null) {
+          hi = ms;
+        } else {
+          lo = ms;
+        }
+        guessMs = (lo + hi) ~/ 2;
+      }
+      return lo;
+    } catch (e) {
+      debugPrint("Error getting duration: $e");
+      return 0;
+    }
+  }
+
+  /// Helper to make thumbnail at specific timestamp
+  Future<Uint8List?> _makeThumbnailAt({
+    required String videoPath,
+    required int millis,
+    required int width,
+    required int quality,
+  }) async {
+    try {
+      return await VideoThumbnail.thumbnailData(
+        video: videoPath,
+        imageFormat: ImageFormat.JPEG,
+        timeMs: millis,
+        quality: quality,
+        maxWidth: width,
+      );
+    } catch (e) {
+      debugPrint("Error making thumbnail at ${millis}ms: $e");
+      return null;
+    }
   }
 }

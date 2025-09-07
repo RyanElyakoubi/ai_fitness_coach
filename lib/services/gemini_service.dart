@@ -5,6 +5,8 @@ import 'package:flutter/services.dart' show rootBundle;
 import 'package:http/http.dart' as http;
 import '../models/score_response.dart';
 import '../models/score_labels.dart';
+import '../models/coach_insights.dart';
+import 'coach_prompt.dart';
 
 class PayloadTooLarge implements Exception {
   final String msg;
@@ -16,6 +18,28 @@ class PayloadTooLarge implements Exception {
 const bool kFakeAnalysis = false;
 const _endpoint = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent';
 const _timeout = Duration(seconds: 120);
+
+// Precheck constants
+const _precheckSystemPreamble = '''
+You are a strict movement classifier for fitness videos.
+
+Decide if the video depicts ANY variety of CHEST PRESS:
+- Bench press (barbell)
+- Dumbbell bench press (flat/incline/decline)
+- Smith/machine chest press
+
+Exclude: squats, deadlifts, OHP/shoulder press, rows, curls, cardio, random content, talking heads.
+
+Return STRICT JSON only:
+{"is_chest_press": true|false, "reason": "<short phrase 3-10 words>"}
+No extra words. No markdown. No trailing commas.
+''';
+
+String _precheckUserPrompt({required bool portraitHint}) => '''
+Determine if this video is a chest-press movement.
+Camera orientation hint: ${portraitHint ? "portrait" : "landscape"}.
+Return only the JSON object as specified.
+''';
 
 Future<String> _loadRubric() async {
   final s = await rootBundle.loadString('assets/bench_rubric.md');
@@ -135,6 +159,7 @@ class GeminiService {
   static Future<ScoreResponse> analyze({
     required List<String> framesBase64Jpeg,
     required List<String> snippetsBase64Mp4,
+    Map<String, dynamic>? requestHints,
   }) async {
     debugPrint("GeminiService.analyze called with kFakeAnalysis=$kFakeAnalysis");
     
@@ -157,13 +182,29 @@ class GeminiService {
     // Load rubric and schema for accurate scoring (available for future use)
     // final rubric = await _loadRubric();
     // final schema = await _loadSchema();
+    
+    bool retriedOnce = false;
 
-    Future<ScoreResponse> _call(List<String> imgs, List<String> clips, {bool strict = false}) async {
+    Future<ScoreResponse> _call(List<String> imgs, List<String> clips, {bool strict = false, Map<String, dynamic>? hints}) async {
       debugPrint("Using consistent rubric-based scoring for maximum accuracy");
+      
+      final hintsText = hints != null ? '''
+
+Input hints:
+- Pipeline: ${hints['pipeline'] ?? 'unknown'}
+- Video duration: ${((hints['trimmed_window_ms'] ?? 0) / 1000).toStringAsFixed(1)}s
+- Window: ${hints['gate_confident'] == true ? 'confident motion detection' : 'fallback window'}
+- Frame count: ${imgs.length} images extracted from workout window
+- Analysis scope: Full bench press set with setup, execution, and completion
+''' : '';
       
       final parts = <Map<String, dynamic>>[
         {
-          "text": '''You are an expert powerlifting judge analyzing bench press technique.
+          "text": '''You are an expert powerlifting judge analyzing bench press technique.$hintsText
+
+CRITICAL: Always attempt to score the lift unless the video is completely unusable. Be very lenient and focus on providing helpful feedback rather than rejecting videos.
+
+IMPORTANT: These frames represent a complete bench press training set extracted from a longer video. If the frames show any bench press sequence (even partial), attempt to score it. Poor lighting, slight blur, or minor visibility issues should NOT prevent scoring - just score lower and note the limitations.
 
 Return ONLY valid JSON that conforms to this schema:
 {
@@ -174,22 +215,25 @@ Return ONLY valid JSON that conforms to this schema:
   "details": { ... } (optional extra)
 }
 
-Reason codes (enums):
-- "poor_lighting"
-- "subject_out_of_frame"
-- "camera_motion"
-- "too_short_clip"
-- "blurry_frames"
-- "wrong_orientation"
-- "occlusions"
-- "bar_not_visible"
-- "multiple_people"
-- "file_corrupt"
+REJECTION GUIDELINES - Only use "insufficient" status in these extreme cases:
+- Video is completely dark/blurry (unable to see anything)
+- No person visible at all in any frame
+- Clearly not a bench press or any lifting movement
+- Video file is corrupted and cannot be analyzed
 
-If no training set is detected (e.g., no bench press reps), respond with:
+DO NOT reject for:
+- Poor lighting (score lower instead)
+- Slight blur (score lower instead) 
+- Bar not perfectly visible (score lower instead)
+- Multiple people in frame (score the main lifter)
+- Camera movement (score lower instead)
+- Short duration (score what you can see)
+- Wrong orientation (score anyway)
+
+If no training set is detected (e.g., completely random content, not a lift), respond with:
 { "status": "no_set" }
 
-If conditions are insufficient, respond with:
+If conditions are truly insufficient (completely unusable video), respond with:
 {
   "status": "insufficient",
   "fail_reasons": ["<one or more enums>"],
@@ -197,6 +241,18 @@ If conditions are insufficient, respond with:
      "<reason>": "<exact canonical sentence below>"
   }
 }
+
+Reason codes (enums) - use sparingly:
+- "poor_lighting" (only if completely dark)
+- "subject_out_of_frame" (only if no person visible at all)
+- "camera_motion" (only if completely unusable)
+- "too_short_clip" (only if no movement visible)
+- "blurry_frames" (only if completely blurred)
+- "wrong_orientation" (only if cannot analyze at all)
+- "occlusions" (only if completely blocked)
+- "bar_not_visible" (only if no bar visible at all)
+- "multiple_people" (only if cannot identify main lifter)
+- "file_corrupt" (only if file cannot be decoded)
 
 Canonical rationale strings (use verbatim):
 - poor_lighting: "Video failed due to poor lighting."
@@ -321,11 +377,54 @@ Return JSON only, no explanation.'''
       // Check status to determine if this is success or failure
       final status = payload['status']?.toString().trim() ?? 'ok';
       
-      if (status != 'ok') {
-        // Parse failure
+      if (status == 'no_set') {
+        // Only reject if it's clearly not a lifting video at all
         final failure = _parseFailure(payload);
-        debugPrint("Gemini returned failure: status=$status, reasons=${failure.reasons}");
+        debugPrint("Gemini returned no_set: ${failure.reasons}");
         return ScoreResponse.failure(failure);
+      } else if (status == 'insufficient') {
+        // Parse failure reasons but be very lenient
+        final failure = _parseFailure(payload);
+        debugPrint("Gemini returned insufficient: status=$status, reasons=${failure.reasons}");
+        
+        // Only reject if it's truly unusable (completely dark, not a lift, or no subject visible)
+        final criticalReasons = [
+          FailReason.file_corrupt,
+          FailReason.subject_out_of_frame, // Only if truly no subject visible
+        ];
+        
+        // Check if ALL failure reasons are critical (meaning truly unusable)
+        final hasOnlyCriticalReasons = failure.reasons.isNotEmpty && 
+            failure.reasons.every((reason) => criticalReasons.contains(reason));
+        
+        // Also check if we have multiple severe issues that make analysis impossible
+        final hasMultipleSevereIssues = failure.reasons.length >= 3 && 
+            failure.reasons.any((reason) => [
+              FailReason.blurry_frames,
+              FailReason.poor_lighting,
+              FailReason.bar_not_visible,
+              FailReason.subject_out_of_frame,
+            ].contains(reason));
+        
+        if (hasOnlyCriticalReasons || hasMultipleSevereIssues) {
+          debugPrint("Video is truly unusable, rejecting");
+          return ScoreResponse.failure(failure);
+        } else {
+          // Video has issues but is still analyzable - return low scores instead of rejecting
+          debugPrint("Video has issues but is analyzable, returning low scores");
+          return ScoreResponse(
+            success: true,
+            holistic: 0,
+            form: 0,
+            intensity: 0,
+            issues: const [],
+            cues: const [],
+            insufficient: true,
+            insufficientReasons: failure.reasons.map((r) => r.toString()).toList(),
+            formSubs: const [],
+            intensitySubs: const [],
+          );
+        }
       } else {
         // Parse success using new sub-score aware parser
         final result = parseScoreOk(payload);
@@ -335,9 +434,15 @@ Return JSON only, no explanation.'''
     }
 
     // Require actual media for analysis
+    // Only fail if we truly have no media at all
     if (framesBase64Jpeg.isEmpty && snippetsBase64Mp4.isEmpty) {
       debugPrint("No frames or snippets available - cannot perform analysis");
-      throw Exception("Video processing failed to extract any frames or clips.\nTry uploading a smaller, clearer video file.");
+      final failureInfo = FailureInfo(
+        status: AnalysisStatus.insufficient,
+        reasons: [FailReason.file_corrupt],
+        rationale: {FailReason.file_corrupt: "No video frames could be extracted"},
+      );
+      return ScoreResponse.failure(failureInfo);
     }
 
     try {
@@ -349,7 +454,28 @@ Return JSON only, no explanation.'''
         final result = await _call(
           framesBase64Jpeg.take(maxFrames).toList(),
           snippetsBase64Mp4.take(1).toList(), // Include 1 video clip if available
+          hints: requestHints,
         );
+        
+        // Guardrail: If status=insufficient but we sent >=20 images, retry once with images-only
+        final imagesCount = framesBase64Jpeg.length;
+        
+        if (result.success == false && result.holistic == 0 && 
+            imagesCount >= 20 && !retriedOnce) {
+          retriedOnce = true;
+          debugPrint("Gemini returned insufficient but we have ${imagesCount} images. Retrying with images-only...");
+          
+          // Retry with images only (no clips) and re-subsampled frames
+          final imageOnlyFrames = math.min(40, framesBase64Jpeg.length);
+          final result2 = await _call(
+            framesBase64Jpeg.take(imageOnlyFrames).toList(),
+            const [], // No clips
+            hints: {...?requestHints, 'retry_reason': 'insufficient_with_good_payload'},
+          );
+          debugPrint("Gemini retry result: holistic=${result2.holistic}, form=${result2.form}, intensity=${result2.intensity}");
+          return result2;
+        }
+        
         debugPrint("Gemini API call successful: holistic=${result.holistic}, form=${result.form}, intensity=${result.intensity}");
         return result;
       } else {
@@ -357,6 +483,7 @@ Return JSON only, no explanation.'''
         final result = await _call(
           const [],
           snippetsBase64Mp4.take(1).toList(),
+          hints: requestHints,
         );
         debugPrint("Gemini API call successful (video only): holistic=${result.holistic}, form=${result.form}, intensity=${result.intensity}");
         return result;
@@ -375,13 +502,13 @@ Return JSON only, no explanation.'''
             framesBase64Jpeg[math.min(4, framesBase64Jpeg.length - 1)], // Lockout
             framesBase64Jpeg[framesBase64Jpeg.length - 1], // Final
           ];
-          final result = await _call(keyFrames, const []);
+          final result = await _call(keyFrames, const [], hints: requestHints);
           debugPrint("Gemini API retry successful (6 frames): holistic=${result.holistic}, form=${result.form}, intensity=${result.intensity}");
           return result;
         } else {
           // Strategy 3: Minimal payload - 3 best frames
           final minFrames = framesBase64Jpeg.take(3).toList();
-          final result = await _call(minFrames, const []);
+          final result = await _call(minFrames, const [], hints: requestHints);
           debugPrint("Gemini API retry successful (3 frames): holistic=${result.holistic}, form=${result.form}, intensity=${result.intensity}");
           return result;
         }
@@ -392,6 +519,236 @@ Return JSON only, no explanation.'''
     } catch (e) {
       debugPrint("Gemini API call failed: $e");
       rethrow;
+    }
+  }
+
+  static Future<String> generateCoachAnalysis({
+    required int holistic,
+    required int form,
+    required int intensity,
+    Map<String, num>? formBreakdown,
+    Map<String, num>? intensityBreakdown,
+    String model = 'gemini-1.5-flash',
+    Duration timeout = const Duration(seconds: 18),
+  }) async {
+    final prompt = CoachPrompt.build(
+      holistic: holistic,
+      form: form,
+      intensity: intensity,
+      formCats: formBreakdown,
+      intensityCats: intensityBreakdown,
+    );
+
+    Future<String> _once() async {
+      final key = const String.fromEnvironment('GEMINI_API_KEY', defaultValue: 'AIzaSyA9EsZLwlAv2c1m9N70ehO1jzhqA9jMdbs');
+      final uri = Uri.parse('https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$key');
+      final body = {
+        "contents": [
+          {
+            "parts": [
+              {"text": prompt}
+            ]
+          }
+        ],
+        "generationConfig": {
+          "temperature": 0.8,
+          "topK": 40,
+          "topP": 0.9,
+          "maxOutputTokens": 220
+        }
+      };
+
+      final res = await http
+          .post(uri, headers: {"Content-Type": "application/json"}, body: jsonEncode(body))
+          .timeout(timeout);
+
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        final j = jsonDecode(res.body);
+        final candidates = (j["candidates"] as List?) ?? const [];
+        if (candidates.isNotEmpty) {
+          final text = (candidates.first["content"]["parts"] as List).map((p) => p["text"]).join("\n");
+          // Safety: trim and enforce 5–8 sentences if model returns more
+          final sents = text
+              .replaceAll('\n', ' ')
+              .split(RegExp(r'(?<=[.!?])\s+'))
+              .where((s) => s.trim().isNotEmpty)
+              .toList();
+          final clamped = sents.take(8).join(' ');
+          return clamped;
+        }
+        throw Exception("Empty Gemini response");
+      } else {
+        throw Exception("Gemini ${res.statusCode}: ${res.body}");
+      }
+    }
+
+    try {
+      return await _once();
+    } catch (e) {
+      // Simple retry for 429/5xx or network glitches
+      return await _once();
+    }
+  }
+
+  static Future<CoachInsights> generateCoachInsights({
+    required int holistic,
+    required int form,
+    required int intensity,
+    Map<String, num>? formBreakdown,
+    Map<String, num>? intensityBreakdown,
+    String model = 'gemini-1.5-flash',
+    Duration timeout = const Duration(seconds: 18),
+  }) async {
+    final prompt = CoachPrompt.buildInsightsJson(
+      holistic: holistic,
+      form: form,
+      intensity: intensity,
+      formCats: formBreakdown,
+      intensityCats: intensityBreakdown,
+    );
+
+    Future<CoachInsights> _once() async {
+      final key = const String.fromEnvironment('GEMINI_API_KEY', defaultValue: 'AIzaSyA9EsZLwlAv2c1m9N70ehO1jzhqA9jMdbs');
+      final uri = Uri.parse('https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$key');
+      final body = {
+        "contents": [
+          {
+            "parts": [
+              {"text": prompt}
+            ]
+          }
+        ],
+        "generationConfig": {
+          "temperature": 0.7,
+          "topK": 40,
+          "topP": 0.9,
+          "maxOutputTokens": 320,
+        }
+      };
+
+      final res = await http
+          .post(uri, headers: {"Content-Type": "application/json"}, body: jsonEncode(body))
+          .timeout(timeout);
+
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        throw Exception("Gemini ${res.statusCode}: ${res.body}");
+      }
+
+      final j = jsonDecode(res.body);
+      final candidates = (j["candidates"] as List?) ?? const [];
+      if (candidates.isEmpty) throw Exception("Empty Gemini response");
+
+      final text = (candidates.first["content"]["parts"] as List).map((p) => p["text"]).join("\n").toString().trim();
+
+      // Extract JSON (strip stray chars if any)
+      final start = text.indexOf('{');
+      final end = text.lastIndexOf('}');
+      if (start < 0 || end < 0 || end <= start) throw Exception("Invalid JSON from model");
+      final jsonSlice = text.substring(start, end + 1);
+
+      final Map<String, dynamic> parsed = json.decode(jsonSlice);
+      return CoachInsights.fromJson(parsed);
+    }
+
+    try {
+      return await _once();
+    } catch (_) {
+      // brief retry for transient errors
+      return await _once();
+    }
+  }
+
+  /// Fast pre-check to classify if video is a chest press movement
+  static Future<PrecheckResult> classifyIsChestPress({
+    required List<Uint8List> scoutFramesJpeg,
+    required bool portraitHint,
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    // If we somehow have no frames, allow analysis (fail-open)
+    if (scoutFramesJpeg.isEmpty) {
+      return PrecheckResult(isChestPress: true, reason: "no frames; fail-open");
+    }
+
+    final key = const String.fromEnvironment('GEMINI_API_KEY', defaultValue: 'AIzaSyA9EsZLwlAv2c1m9N70ehO1jzhqA9jMdbs');
+    if (key.isEmpty) {
+      return PrecheckResult(isChestPress: true, reason: "no API key; fail-open");
+    }
+
+    final uri = Uri.parse('https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=$key');
+
+    // Build parts: system preamble + user instruction + up to 8 images
+    final inputs = <Map<String, dynamic>>[
+      {"text": _precheckSystemPreamble},
+      {"text": _precheckUserPrompt(portraitHint: portraitHint)},
+    ];
+
+    // Attach images (base64) as inline data; cap at 8
+    final capped = scoutFramesJpeg.take(8).toList();
+    for (final bytes in capped) {
+      inputs.add({
+        "inline_data": {
+          "mime_type": "image/jpeg",
+          "data": base64Encode(bytes),
+        }
+      });
+    }
+
+    final body = {
+      "contents": [
+        {
+          "role": "user",
+          "parts": inputs,
+        }
+      ],
+      "generationConfig": {
+        "temperature": 0.1,
+        "topP": 0.2,
+        "topK": 20,
+        "maxOutputTokens": 64,
+        "responseMimeType": "application/json"
+      }
+    };
+
+    try {
+      final resp = await http
+          .post(uri, headers: {"Content-Type": "application/json"}, body: jsonEncode(body))
+          .timeout(timeout);
+
+      if (resp.statusCode != 200) {
+        debugPrint("Precheck API error ${resp.statusCode}: ${resp.body}");
+        return PrecheckResult(isChestPress: true, reason: "API error; fail-open");
+      }
+
+      final data = jsonDecode(resp.body) as Map<String, dynamic>;
+      final candidates = (data["candidates"] as List?) ?? const [];
+      if (candidates.isEmpty) {
+        return PrecheckResult(isChestPress: true, reason: "no response; fail-open");
+      }
+
+      final partsOut = (candidates.first["content"]?["parts"] as List?) ?? const [];
+      final buf = StringBuffer();
+      for (final p in partsOut) {
+        final t = p["text"];
+        if (t is String) buf.write(t);
+      }
+      var text = buf.toString().trim();
+      
+      // Clean up any markdown formatting
+      if (text.startsWith("```")) {
+        text = text.replaceAll(RegExp(r"^```[a-zA-Z]*\n|\n```\s*$"), "");
+      }
+
+      // Strict JSON parse, fallback to pass-through if invalid
+      final parsed = jsonDecode(text) as Map<String, dynamic>;
+      final isChest = (parsed["is_chest_press"] == true);
+      final reason = (parsed["reason"] ?? "").toString();
+      
+      debugPrint("Precheck result: isChestPress=$isChest, reason=$reason");
+      return PrecheckResult(isChestPress: isChest, reason: reason);
+    } catch (e) {
+      debugPrint("Precheck failed: $e");
+      // Do not block; allow analysis if precheck failed
+      return PrecheckResult(isChestPress: true, reason: "precheck error; fail-open");
     }
   }
 

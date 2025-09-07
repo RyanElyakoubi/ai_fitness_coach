@@ -24,7 +24,7 @@ class CategoryScore<T> {
   const CategoryScore({required this.key, required this.score});
 }
 
-enum AnalysisStatus { ok, no_set, insufficient }
+enum AnalysisStatus { ok, no_set, insufficient, no_grade_not_bench }
 
 enum FailReason {
   poor_lighting,
@@ -49,6 +49,13 @@ class FailureInfo {
     required this.reasons,
     required this.rationale,
   });
+}
+
+class PrecheckResult {
+  final bool isChestPress;
+  final String reason;
+  
+  PrecheckResult({required this.isChestPress, required this.reason});
 }
 
 int _clamp01_100(num? v) {
@@ -296,6 +303,57 @@ class ScoreResponse {
       formSubs: formSubs ?? this.formSubs,
       intensitySubs: intensitySubs ?? this.intensitySubs,
     );
+  }
+
+  // Category breakdown maps for coach analysis
+  Map<String, num>? get formBreakdownMap {
+    if (formSubs.isEmpty) return null;
+    final map = <String, num>{};
+    for (final sub in formSubs) {
+      switch (sub.key) {
+        case SubFormKey.bar_path:
+          map['Bar Path'] = sub.score;
+          break;
+        case SubFormKey.range_of_motion:
+          map['Range of Motion'] = sub.score;
+          break;
+        case SubFormKey.stability:
+          map['Stability'] = sub.score;
+          break;
+        case SubFormKey.elbow_wrist:
+          map['Wrists & Elbow Flare'] = sub.score;
+          break;
+        case SubFormKey.leg_drive:
+          map['Leg Drive'] = sub.score;
+          break;
+      }
+    }
+    return map.isNotEmpty ? map : null;
+  }
+
+  Map<String, num>? get intensityBreakdownMap {
+    if (intensitySubs.isEmpty) return null;
+    final map = <String, num>{};
+    for (final sub in intensitySubs) {
+      switch (sub.key) {
+        case SubIntensityKey.power:
+          map['Power'] = sub.score;
+          break;
+        case SubIntensityKey.uniformity:
+          map['Uniformity'] = sub.score;
+          break;
+        case SubIntensityKey.proximity_failure:
+          map['Proximity to Failure'] = sub.score;
+          break;
+        case SubIntensityKey.cadence:
+          map['Cadence'] = sub.score;
+          break;
+        case SubIntensityKey.bar_speed_consistency:
+          map['Bar-speed Consistency'] = sub.score;
+          break;
+      }
+    }
+    return map.isNotEmpty ? map : null;
   }
 
   // Convenience getters for percentages

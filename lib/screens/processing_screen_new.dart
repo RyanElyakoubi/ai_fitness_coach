@@ -1,14 +1,9 @@
 import 'dart:convert';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import '../services/sampling_service.dart';
 import '../services/rep_sampler.dart';
 import '../services/gemini_service.dart';
 import '../services/gating_service.dart';
-import '../services/storage_guard.dart';
-import '../services/cache_cleaner.dart';
-import '../models/score_response.dart';
 import '../ui/style.dart';
 import '../widgets/animated_gradient_square.dart';
 
@@ -37,8 +32,6 @@ class _ProcessingScreenState extends State<ProcessingScreen> with SingleTickerPr
       duration: const Duration(seconds: 6),
       vsync: this,
     )..repeat();
-    // Best-effort clean
-    CacheCleaner.purgeOldFiles();
     WidgetsBinding.instance.addPostFrameCallback((_) => _begin());
   }
 
@@ -55,19 +48,6 @@ class _ProcessingScreenState extends State<ProcessingScreen> with SingleTickerPr
     setState(() => _state = ProcState.running);
     
     try {
-      // Step 0: Storage preflight check
-      setState(() => _currentStep = 'Checking storage...');
-      
-      // Rough estimate: images*40KB + clips*1MB + overhead. Use upper bounds.
-      const estImages = 60;
-      const estClips = 2;
-      final estimatedBytes = (estImages * 40 * 1024) + (estClips * 1 * 1024 * 1024) + (2 * 1024 * 1024);
-      final storageOk = await StorageGuard.canWriteTemp(estimatedBytes: estimatedBytes);
-      if (!storageOk) {
-        _showFriendlyLowStorage();
-        return;
-      }
-      
       // Step 1: Gate check
       setState(() => _currentStep = 'Checking daily limits...');
       
@@ -77,61 +57,10 @@ class _ProcessingScreenState extends State<ProcessingScreen> with SingleTickerPr
         return;
       }
 
-      // Step 1.5: Pre-check classification (chest press vs other movements)
-      setState(() => _currentStep = 'Classifying movement...');
-      
-      final samplingService = SamplingService();
-      final scoutFrames = await samplingService.getScoutFramesForPrecheck(
-        videoPath: videoPath,
-        desiredCount: 8,
-        windowStart: null, // We don't have window info yet
-        windowEnd: null,
-      );
-      
-      final precheck = await GeminiService.classifyIsChestPress(
-        scoutFramesJpeg: scoutFrames,
-        portraitHint: true, // We normalize to portrait elsewhere
-      );
-      
-      // If NOT chest press -> no-grade result + navigate to Scorecard (no analysis)
-      if (!precheck.isChestPress) {
-        debugPrint("Precheck: not chest press (reason: ${precheck.reason})");
-        final noGradeResult = ScoreResponse(
-          success: false,
-          holistic: 0,
-          form: 0,
-          intensity: 0,
-          issues: const [],
-          cues: const [],
-          insufficient: false,
-          insufficientReasons: const [],
-          failure: FailureInfo(
-            status: AnalysisStatus.no_grade_not_bench,
-            reasons: const [],
-            rationale: {FailReason.file_corrupt: precheck.reason.isEmpty ? "Not a chest-press movement" : precheck.reason},
-          ),
-        );
-        if (!mounted) return;
-        Navigator.pushReplacementNamed(
-          context,
-          '/feedback',
-          arguments: noGradeResult,
-        );
-        return;
-      }
-
       // Step 2: Sampling (now uses isolate + motion gate)
       setState(() => _currentStep = 'Analyzing video...');
       
       final sampling = await _repSampler.sample(videoPath);
-      
-      // Enhanced logging as specified
-      print('Trimmed window: start=${sampling.trimmedStartMs}ms '
-           'end=${sampling.trimmedEndMs}ms '
-           'len=${sampling.trimmedEndMs - sampling.trimmedStartMs}ms '
-           'confident=${sampling.gateConfident} reason=${sampling.gateRationale}');
-      print('Payload: anchors=${sampling.anchors.length} '
-           'images=${sampling.frames.length} clips=${sampling.clips.length}');
       
       // Step 3: Convert to base64 for Gemini
       setState(() => _currentStep = 'Preparing for AI analysis...');
@@ -165,7 +94,6 @@ class _ProcessingScreenState extends State<ProcessingScreen> with SingleTickerPr
       
       await _gating.recordAnalysisUsed();
       
-      // Proceed if we got any valid scores OR if we have a reasonable payload
       if (result.holistic > 0 || result.form > 0 || result.intensity > 0) {
         if (!mounted) return;
         Navigator.pushReplacementNamed(
@@ -173,19 +101,8 @@ class _ProcessingScreenState extends State<ProcessingScreen> with SingleTickerPr
           '/feedback',
           arguments: result,
         );
-      } else if (framesBase64.isEmpty && clipsBase64.isEmpty) {
-        // Only fail if we truly have no media
-        _showFail(['no_media'], fallback: 'empty_payload');
       } else {
-        // Have media but insufficient analysis - still show failure but with context
         _showFail(['insufficient'], fallback: sampling.gateRationale);
-      }
-    } on PlatformException catch (e) {
-      final msg = e.message ?? '';
-      if (msg.contains('out of space') || msg.contains('No space')) {
-        _showFriendlyLowStorage();
-      } else {
-        _showFail(['pipeline_error'], fallback: 'Could not access selected video.');
       }
     } catch (e) {
       _showFail(['pipeline_error'], fallback: 'pipeline_error');
@@ -194,41 +111,13 @@ class _ProcessingScreenState extends State<ProcessingScreen> with SingleTickerPr
 
   void _showFail(List<String> reasons, {required String fallback}) {
     if (!mounted) return;
-    
-    // Create proper FailureInfo object
-    final failureInfo = FailureInfo(
-      status: AnalysisStatus.insufficient,
-      reasons: [FailReason.blurry_frames], // Default reason
-      rationale: {FailReason.blurry_frames: fallback},
-    );
-    
     Navigator.pushReplacementNamed(
       context,
       '/scorecard_failed', 
-      arguments: failureInfo,
-    );
-  }
-
-  void _showFriendlyLowStorage() {
-    if (!mounted) return;
-    
-    // Show user-friendly storage error
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        title: const Text('Storage Full'),
-        content: const Text('Your device is low on storage. Please free up space and try again.'),
-        actions: [
-          TextButton(
-            onPressed: () {
-              Navigator.of(context).pop(); // Close dialog
-              Navigator.of(context).pop(); // Go back to previous screen
-            },
-            child: const Text('OK'),
-          ),
-        ],
-      ),
+      arguments: {
+        'reasons': reasons,
+        'rationale': fallback,
+      },
     );
   }
 

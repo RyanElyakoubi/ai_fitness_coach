@@ -44,5 +44,9 @@
 	<string>Camera is used to record your bench press set for analysis.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Microphone is used to capture audio during recording.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>We need access to your video to analyze your lift.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>We save processed clips to your library when you ask us to.</string>
 </dict>
 </plist>

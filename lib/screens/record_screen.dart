@@ -9,6 +9,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
 import 'package:file_picker/file_picker.dart';
 import '../ui/style.dart';
+import '../widgets/frosted_mask_overlay.dart';
 
 class RecordScreen extends StatefulWidget {
   static const routeName = '/';
@@ -261,6 +262,37 @@ class _RecordScreenState extends State<RecordScreen> with TickerProviderStateMix
           );
         }
       }
+    } on PlatformException catch (e) {
+      final msg = e.message ?? '';
+      if (mounted) {
+        if (msg.contains('out of space') || msg.contains('No space')) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Your device is low on storage. Please free up space and try again.'),
+              duration: Duration(seconds: 4),
+            ),
+          );
+        } else {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Failed to access selected video. Please try again.')),
+          );
+        }
+      }
+    } on FileSystemException catch (e) {
+      if (mounted) {
+        if (e.message.contains('No space')) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Your device is low on storage. Please free up space and try again.'),
+              duration: Duration(seconds: 4),
+            ),
+          );
+        } else {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Failed to copy video. Please try again.')),
+          );
+        }
+      }
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -298,114 +330,157 @@ class _RecordScreenState extends State<RecordScreen> with TickerProviderStateMix
     );
   }
 
+  Widget _buildCameraPreview() {
+    if (!_controller!.value.isInitialized) {
+      return const SizedBox.shrink();
+    }
+    // Use standard FittedBox with BoxFit.cover for normal zoom level
+    return FittedBox(
+      fit: BoxFit.cover,
+      child: SizedBox(
+        width: _controller!.value.previewSize!.height, // note: width/height swapped for camera
+        height: _controller!.value.previewSize!.width,
+        child: CameraPreview(_controller!),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final canRecord = _controllerReady && !_recording;
-    const double kUploadButtonHeight = 52; // visual height incl. padding
+    final size = MediaQuery.of(context).size;
+    final pad = MediaQuery.of(context).padding;
 
-    return Container(
-      decoration: const BoxDecoration(gradient: AppStyle.pageBg), // fallback if preview not ready
-      child: SafeArea(
-        bottom: true,
-        child: Scaffold(
-          backgroundColor: Colors.transparent,
-          body: Stack(
-            fit: StackFit.expand,
-            children: [
-              // 1) Live camera fills background
-              if (_controller != null)
-                FutureBuilder(
-                  future: _cameraInit,
-                  builder: (context, snap) {
-                    if (snap.connectionState == ConnectionState.done && _controller!.value.isInitialized) {
-                      return FittedBox(
-                        fit: BoxFit.cover, // aspect-fill like Snapchat
-                        child: SizedBox(
-                          width: _controller!.value.previewSize!.height, // note: width/height swapped
-                          height: _controller!.value.previewSize!.width,
-                          child: CameraPreview(_controller!),
-                        ),
-                      );
-                    }
-                    return const SizedBox.shrink(); // fallback to gradient below
-                  },
-                ),
+    final double sideMargin = 20;
+    final double topGuide = pad.top + 82;       // unchanged (top stays put)
+    // Increase height: was ~0.62, make it taller without touching the top
+    final double windowHeight = size.height * 0.72; // expand downward
 
-              // Optional: subtle vignette so overlaid text stays readable
-              IgnorePointer(
-                child: DecoratedBox(
-                  decoration: const BoxDecoration(
-                    gradient: LinearGradient(
-                      begin: Alignment.topCenter, end: Alignment.bottomCenter,
-                      colors: [Color(0x660E1220), Color(0x330E1220), Color(0x880E1220)],
-                      stops: [0.0, 0.5, 1.0],
-                    ),
-                  ),
-                ),
-              ),
+    // Clamp bottom so we don't collide with the home indicator
+    final double maxBottom = size.height - (pad.bottom + 112); // leaves space for Upload
+    final double desiredBottom = (topGuide + windowHeight).clamp(topGuide + 280, maxBottom);
+    final Rect clearRect = Rect.fromLTWH(
+      sideMargin,
+      topGuide,
+      size.width - sideMargin * 2,
+      desiredBottom - topGuide,
+    );
 
+    // Record button sits inside the window near the bottom
+    final double recordY = clearRect.bottom - 128; // 128 px above window bottom
 
-              // 3) Center hero text (hide while recording)
-              if (!_recording)
-                Align(
-                  alignment: Alignment.center,
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 24.0),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(
-                          "Tap to record a short video\nof your lift.",
-                          style: AppStyle.hero, textAlign: TextAlign.center,
-                        ),
-                        const SizedBox(height: 10),
-                        Text(
-                          "Portrait. Full body & bar in frame.\nGood lighting helps analysis.",
-                          style: AppStyle.sub, textAlign: TextAlign.center,
-                        ),
+    // Upload button centered between window bottom and device bottom
+    final double uploadCenterY = (clearRect.bottom + (size.height - pad.bottom)) / 2;
+    final double uploadTop = uploadCenterY - 28; // if your upload button is ~56px tall
+
+    return Scaffold(
+      backgroundColor: Colors.transparent,
+      extendBodyBehindAppBar: true,
+      body: Stack(
+        children: [
+          // 1) Camera full bleed
+          if (_controller != null)
+            FutureBuilder(
+              future: _cameraInit,
+              builder: (context, snap) {
+                if (snap.connectionState == ConnectionState.done && _controller!.value.isInitialized) {
+                  return Positioned.fill(child: _buildCameraPreview());
+                }
+                return const SizedBox.shrink(); // fallback
+              },
+            ),
+
+          // 2) Frosted mask outside the window
+          FrostedMaskOverlay(
+            clearRect: clearRect,
+            radius: 24,
+            blurSigma: 22,
+            tint: const Color(0xCC0B0E17), // ~80% dark tint
+          ),
+
+          // 2.5) FormAI Logo at the top
+          Positioned(
+            top: pad.top + 20,
+            left: 0,
+            right: 0,
+            child: Center(
+              child: _FormAILogo(),
+            ),
+          ),
+
+          // 3) Friendly, single-sentence guidance centered in the window
+          if (!_recording)
+            Positioned(
+              left: clearRect.left + 16,
+              right: clearRect.right - 16,
+              top: clearRect.top + (clearRect.height / 2) - 14, // roughly vertically centered
+              child: Text(
+                "Keep your full body and the bar in view, with steady lighting.",
+                textAlign: TextAlign.center,
+                maxLines: 2,
+                softWrap: true,
+                style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                      color: Colors.white.withValues(alpha: 0.85),
+                      fontWeight: FontWeight.w600,
+                      shadows: const [
+                        Shadow(blurRadius: 6, color: Colors.black54, offset: Offset(0, 1)),
                       ],
                     ),
+              ),
+            ),
+
+          // 4) RECORD button (inside window)
+          Positioned(
+            top: recordY,
+            left: 0,
+            right: 0,
+            child: Center(
+              child: _CaptureButton(
+                isRecording: _recording,
+                enabled: (_controllerReady && !_recording) || _recording,
+                onTap: () async {
+                  if (_recording) {
+                    await _stopRecording();
+                  } else if (_controllerReady) {
+                    await _startRecording();
+                  } else {
+                    _showSnack("Camera not available — try Upload Video");
+                  }
+                },
+                progress: _recording ? _recProgress : 0.0,
+                ringOpacity: _ringOpacity,
+              ),
+            ),
+          ),
+
+          // 5) UPLOAD button (centered between window bottom and safe area bottom)
+          Positioned(
+            top: uploadTop,
+            left: 24,
+            right: 24,
+            child: AnimatedSwitcher(
+              duration: const Duration(milliseconds: 160),
+              child: _recording
+                  ? const SizedBox(height: 52) // spacer to preserve layout
+                  : _UploadButton(onTap: _onUploadPressed),
+            ),
+          ),
+
+          // 6) Subtle stroke around clear window
+          Positioned.fromRect(
+            rect: clearRect,
+            child: IgnorePointer(
+              child: Container(
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(24),
+                  border: Border.all(
+                    width: 1.2,
+                    color: Colors.white.withValues(alpha: 0.10),
                   ),
                 ),
-
-              // 4) Bottom actions: capture is fixed; we reserve space for Upload when hidden
-              Positioned(
-                left: 20,
-                right: 20,
-                // Keep a fixed bottom offset for the capture button, independent of upload visibility.
-                bottom: MediaQuery.of(context).padding.bottom + 18 + kUploadButtonHeight + 14,
-                child: _CaptureButton(
-                  isRecording: _recording,
-                  enabled: (_controllerReady && !_recording) || _recording,
-                  onTap: () async {
-                    if (_recording) {
-                      await _stopRecording();
-                    } else if (_controllerReady) {
-                      await _startRecording();
-                    } else {
-                      _showSnack("Camera not available — try Upload Video");
-                    }
-                  },
-                  progress: _recording ? _recProgress : 0.0,
-                  ringOpacity: _ringOpacity,
-                ),
               ),
-
-              // Upload area pinned to the very bottom; when recording we keep a transparent spacer
-              Positioned(
-                left: 20,
-                right: 20,
-                bottom: MediaQuery.of(context).padding.bottom + 18,
-                child: AnimatedSwitcher(
-                  duration: const Duration(milliseconds: 160),
-                  child: _recording
-                      ? SizedBox(height: kUploadButtonHeight) // spacer to preserve layout
-                      : _UploadButton(onTap: _onUploadPressed),
-                ),
-              ),
-            ],
+            ),
           ),
-        ),
+        ],
       ),
     );
   }
@@ -457,7 +532,7 @@ class _CaptureButton extends StatelessWidget {
           foregroundPainter: _ProgressRingPainter(
             progress: progress,
             strokeWidth: strokeW,
-            color: const Color(0xFFFF4D4D).withOpacity(ringOpacity.clamp(0.0, 1.0)),
+            color: const Color(0xFFFF4D4D).withValues(alpha: ringOpacity.clamp(0.0, 1.0)),
           ),
           child: Center(
             child: AnimatedContainer(
@@ -517,6 +592,30 @@ class _UploadButton extends StatelessWidget {
   }
 }
 
+class _FormAILogo extends StatelessWidget {
+  const _FormAILogo();
+
+  @override
+  Widget build(BuildContext context) {
+    return ShaderMask(
+      shaderCallback: (bounds) => const LinearGradient(
+        colors: [Color(0xFF7C3AED), Color(0xFFEC4899)], // App's gradient colors
+        begin: Alignment.topLeft,
+        end: Alignment.bottomRight,
+      ).createShader(bounds),
+      child: const Text(
+        'FormAI',
+        style: TextStyle(
+          fontSize: 32,
+          fontWeight: FontWeight.w800,
+          color: Colors.white, // This will be masked by the gradient
+          letterSpacing: 1.2,
+        ),
+      ),
+    );
+  }
+}
+
 class _ProgressRingPainter extends CustomPainter {
   final double progress;    // 0..1
   final double strokeWidth;
@@ -529,7 +628,7 @@ class _ProgressRingPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    if (progress <= 0 || color.opacity == 0) return;
+    if (progress <= 0 || color.a == 0) return;
 
     final center = Offset(size.width / 2, size.height / 2);
     final radius = (size.shortestSide - strokeWidth) / 2;
