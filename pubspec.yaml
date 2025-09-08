@@ -45,6 +45,7 @@ dependencies:
   file_picker: ^8.0.0+1
   video_thumbnail: ^0.5.6
   image: ^4.1.7
+  shared_preferences: ^2.2.2
 # ffmpeg_kit_flutter_min_gpl: ^5.1.0  # Commented out due to 404 download issues
 
 dev_dependencies:

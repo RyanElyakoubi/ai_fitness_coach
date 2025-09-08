@@ -407,6 +407,19 @@ class _RecordScreenState extends State<RecordScreen> with TickerProviderStateMix
             ),
           ),
 
+          // 2.6) Info button in top-right corner
+          Positioned(
+            top: pad.top + 20,
+            right: 20,
+            child: IconButton(
+              tooltip: 'Recording tips',
+              icon: const Icon(Icons.info_outline, color: Colors.white),
+              onPressed: () {
+                Navigator.of(context).pushNamed('/instructions');
+              },
+            ),
+          ),
+
           // 3) Friendly, single-sentence guidance centered in the window
           if (!_recording)
             Positioned(
@@ -597,21 +610,37 @@ class _FormAILogo extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ShaderMask(
-      shaderCallback: (bounds) => const LinearGradient(
-        colors: [Color(0xFF7C3AED), Color(0xFFEC4899)], // App's gradient colors
-        begin: Alignment.topLeft,
-        end: Alignment.bottomRight,
-      ).createShader(bounds),
-      child: const Text(
-        'FormAI',
-        style: TextStyle(
-          fontSize: 32,
-          fontWeight: FontWeight.w800,
-          color: Colors.white, // This will be masked by the gradient
-          letterSpacing: 1.2,
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // "Form" in white
+        const Text(
+          'Form',
+          style: TextStyle(
+            fontSize: 32,
+            fontWeight: FontWeight.w800,
+            color: Colors.white,
+            letterSpacing: 1.2,
+          ),
         ),
-      ),
+        // "AI" with gradient
+        ShaderMask(
+          shaderCallback: (bounds) => const LinearGradient(
+            colors: [Color(0xFF7C3AED), Color(0xFFEC4899)], // App's gradient colors
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+          ).createShader(bounds),
+          child: const Text(
+            'AI',
+            style: TextStyle(
+              fontSize: 32,
+              fontWeight: FontWeight.w800,
+              color: Colors.white, // This will be masked by the gradient
+              letterSpacing: 1.2,
+            ),
+          ),
+        ),
+      ],
     );
   }
 }

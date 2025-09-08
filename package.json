@@ -1,0 +1,15 @@
+{
+  "name": "bench_mvp",
+  "version": "1.0.0",
+  "description": "Flutter iOS project with CocoaPods integration",
+  "scripts": {
+    "ios:clean": "bash tool/ios_pods_reset.sh",
+    "ios:open": "open ios/Runner.xcworkspace",
+    "ios:run": "flutter clean && flutter pub get && (cd ios && pod install) && flutter run --device-id=\"iPhone (3)\"",
+    "ios:build": "flutter build ios --no-codesign"
+  },
+  "keywords": ["flutter", "ios", "cocoapods"],
+  "author": "",
+  "license": "ISC"
+}
+

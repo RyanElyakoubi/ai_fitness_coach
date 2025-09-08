@@ -1,11 +1,13 @@
 import 'package:flutter/material.dart';
 import 'services/revenuecat_service.dart';
 import 'services/cache_cleaner.dart';
+import 'services/first_run_service.dart';
 import 'screens/record_screen.dart';
 import 'screens/processing_screen.dart';
 import 'screens/feedback_screen.dart';
 import 'screens/paywall_screen.dart';
 import 'screens/scorecard_failed_screen.dart';
+import 'screens/instructions_screen.dart';
 import 'models/score_response.dart';
 
 void main() async {
@@ -31,9 +33,9 @@ class BenchMvpApp extends StatelessWidget {
         fontFamily: 'SF Pro',
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue, brightness: Brightness.dark),
       ),
-      initialRoute: RecordScreen.routeName,
       routes: {
-        RecordScreen.routeName: (_) => const RecordScreen(),
+        '/instructions': (_) => const InstructionsScreen(),
+        '/home': (_) => const RecordScreen(),
         ProcessingScreen.routeName: (_) => const ProcessingScreen(),
         FeedbackScreen.routeName: (_) => const FeedbackScreen(),
         PaywallScreen.routeName: (_) => const PaywallScreen(),
@@ -42,6 +44,7 @@ class BenchMvpApp extends StatelessWidget {
           return ScorecardFailedScreen(failure: args);
         },
       },
+      home: const InstructionsScreen(),
     );
   }
 }
